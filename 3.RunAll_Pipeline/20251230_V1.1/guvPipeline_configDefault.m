@@ -1,0 +1,264 @@
+function Cfg = guvPipeline_configDefault()
+%GUVCONFIG_DEFAULT 参数中心（重构后精简版）
+% =========================================================================
+% 重要原则（团队协作建议）：
+%   1) 只在本文件改“开关/阈值/路径”。算法实现细节在 Detect/Fuse/Track 内部函数。
+%   2) 本配置只覆盖“读图→检测→同帧融合→追踪→导出(TTracks/表格/调试视频)”链路。
+%      不包含追踪后的计算/过滤/可视化。
+%
+% 你最终确认的三条核心规则：
+%   (R1) 每个通道都能生成对象 mask；若同一对象在两通道都存在，取 imfill 后面积更大者为主 ref mask。
+%   (R2) 所有通道的强度（inner/mem/bg）统一在“主 ref mask（subMask + memBandMask）”上测量。
+%   (R3) Cfg.Read.CType 仅决定“识别时如何构造 mask”（inner 或 mem），不改变强度的物理含义。
+%       - meanIntensity_inner：实心区域平均强度（subMask）
+%       - meanIntensity_mem  ：实心区域边界固定厚度环带平均强度（memBandMask）
+%
+% 使用：
+%   Cfg = guvPipeline_configDefault();
+%   MasterTable = GUV_Pipeline(Cfg);
+
+Cfg = struct();
+
+%% ============================= 1) 路径与输出 =============================
+Cfg.ND2Path = 'G:\人造细胞\HAO\20251218.nd2';
+Cfg.OutRoot = 'G:\人造细胞\HAO\20251218_output2';
+Cfg.SeriesPrefix = 'XY';  % 输出子文件夹前缀：XY001/XY002...
+
+%% ============================= 2) 像素尺寸（um/px） ======================
+% 若 ND2 metadata 可读取到像素尺寸，Pipeline 会自动覆盖此值。
+Cfg.PixelSize_um = 0.16;
+
+%% 帧间隔（秒/帧）：用于把帧号换算成时间轴（表格导出/视频标注）
+% 若 ND2 metadata 可读取到帧间隔，Pipeline 会自动覆盖此值。
+Cfg.FrameInterval_s = 600.0;
+
+%% ============================= 3) 读取设置（Series / Z / 通道） ===========
+Cfg.Read = struct();
+Cfg.Read.SelectXYs = [29 30];     % 例如 [2 5 10]；空=[]表示全跑
+Cfg.Read.Z = 1;              % 本项目默认 Z=1
+Cfg.Read.CList  = [1 2];     % 需要读取的通道序号（bfGetPlaneAtZCT 的 C）
+Cfg.Read.CNames = {'488','640'};            % 用于输出命名/表格列名提示
+Cfg.Read.CType  = {'inner','inner'};          % 仅影响识别 mask 构造：'inner' 或 'mem'
+Cfg.Read.RefC   = 1;         % “显示/组织输出”的主通道：用于输出目录命名、legacy字段(meanIntensities)映射、视频背景
+Cfg.Read.OtherC = [];        % 可选：指定另一个通道（用于双通道Debug面板/视频）；空=[]则自动取非RefC的第一个通道
+
+%% ============================= 4) 同帧融合（Fuse） ========================
+% 只负责“同一帧内”把两通道对象配对并选主 ref mask（更大面积者）。
+Cfg.Fuse = struct();
+Cfg.Fuse.Pair = struct();
+Cfg.Fuse.Pair.MaxDist_um = 3;    % 质心配对距离门限（µm），典型 3~10
+Cfg.Fuse.Pair.UseIoU = true;     % 是否用 IoU 做二次确认（膜/内水差异大时可开）
+Cfg.Fuse.Pair.MinIoU = 0.05;     % IoU 下限（可很低）
+
+%% ============================= 5) 检测（Detect） =========================
+Cfg.Detect = struct();
+
+% 目标尺寸筛选（主轴长度范围，µm）
+Cfg.Detect.MinMajor_um = 5;
+Cfg.Detect.MaxMajor_um = 80;
+
+% (旧逻辑保留) inner-mem 合并后的“近邻去重/合并”：
+% - 你要求：在新逻辑中等价于“只作用于 CType='mem' 的通道”。
+Cfg.Detect.SuppressCloseOnMem = true;
+Cfg.Detect.SuppressDist_um = 2;  % 近邻阈值（µm）
+
+% Detect.Opts：检测内部参数（尽量少且清晰）
+opts = struct();
+
+% --- 预处理/阈值 ---
+opts.bin.sigma = 1.2;        % 高斯平滑 sigma（px）
+opts.bin.adapt_sensitivity = 0.15; % adaptive threshold 灵敏度（0~1，越大越容易判为前景）
+opts.bin.minHoleArea = 10;   % 填洞最小面积（px^2）
+
+% --- 形态学清理 ---
+opts.inner.areaOpen = 150;    % 去除小连通域（px^2）
+
+% --- 可选：分割（对粘连很重时启用；与后处理分水岭不同）---
+opts.split.doSplit = false;
+opts.split.openR  = 2;       % 开运算半径（px）
+opts.split.splitH = 2.0;     % h-minima（越小越容易分割）
+
+% --- 薄环(memBand)：固定厚度，用于 meanIntensity_mem ---
+opts.band.width_px = 5;      % 环带厚度（px），典型 2~5
+opts.mem = struct();
+opts.mem.thickR  = opts.band.width_px; % 与 guvDetect_computeMemBandFromSubMasks 一致（imdilate/imerode 半径）
+opts.mem.smoothR = 2;                 % 膜mask平滑半径（用于生成更稳定的band边界）
+
+% --- Detect Debug figure（批量建议 false；单XY调试用）---
+opts.debug.makeFigure = false;
+
+Cfg.Detect.Opts = opts;
+
+%% ============================= 6) 后处理分割（面积覆盖率自适应分水岭） ====
+% 对照旧包：guvDetect_postSplitByCoverageWatershed（保留，且阈值可控）
+Cfg.Post = struct();
+Cfg.Post.Watershed = struct();
+Cfg.Post.Watershed.Enable = true;
+
+% Tau：面积覆盖率阈值（越小越容易触发“更激进”的分割）
+Cfg.Post.Watershed.Tau = 0.60;
+
+% hLow/hHigh：h-minima 的两档值（低：更容易分割；高：更保守）
+Cfg.Post.Watershed.hLow  = 2.0;
+Cfg.Post.Watershed.hHigh = 10.0;
+
+% SigmaD：距离变换平滑尺度（px）
+Cfg.Post.Watershed.SigmaD = 1.0;
+
+% MinAreaPx：子区域最小面积（px^2），过小的分割碎片丢弃
+Cfg.Post.Watershed.MinAreaPx = 150;
+
+% MarginPx：ROI 扩边（避免边界截断影响分割）
+Cfg.Post.Watershed.MarginPx = 4;
+
+% MaxChild：最多保留的子区域数（防止爆炸式过分割）
+Cfg.Post.Watershed.MaxChild = 3;
+
+%% ============================= 7) 追踪（Track） ==========================
+Cfg.Track = struct();
+Cfg.Track.DistGate_um = 8;      % 帧间关联距离门限（µm）
+Cfg.Track.MaxGap = 2;           % 最大断帧数
+Cfg.Track.MinLen = 10;           % 最短轨迹长度（过滤噪声）
+Cfg.Track.Opts = struct();
+Cfg.Track.Opts.DistGate_um = Cfg.Track.DistGate_um;
+Cfg.Track.Opts.MaxGap = Cfg.Track.MaxGap;
+Cfg.Track.Opts.MinLen = Cfg.Track.MinLen;
+Cfg.Track.Opts.EstimateGlobalDrift = true;  % 全局漂移估计（整体漂移明显时强烈建议 true）
+Cfg.Track.Opts.IoUUseFilledMask = false;  % 若追踪内部使用 IoU，可选择用 filled mask 计算
+
+% （新增）是否在 TTracks.mat 中保存“每帧每个GUV的轮廓线”数据
+% 说明：轮廓来自每帧保存的 GUVData.boundaries（像素坐标），在追踪完成后按质心最近匹配到轨迹上。
+Cfg.Track.SaveBoundary = false;       % true: 额外写入 TTracks(id).boundaries{...}
+Cfg.Track.BoundaryMatch_um = 3;       % 轮廓匹配最大距离（µm），建议 2~5
+
+%% ============================= 8) 输出控制（IO） ==========================
+Cfg.Output = struct();
+Cfg.Output.SavePerFrameMAT   = true;
+Cfg.Output.SaveImgInFrameMAT = false;  % 强烈建议 false（避免磁盘爆炸）；视频背景用 FrameStore
+Cfg.Output.SaveFrameStore    = true;   % 建议 true：保存一个 HDF5 用于视频背景与快速回读
+Cfg.Output.FrameStoreName    = 'FrameStore.h5';
+Cfg.Output.FrameStoreDeflate = 1;      % HDF5 压缩等级 0~9（1即可）
+% FrameStoreMode：视频导出是否需要“无 ND2 依赖”的双通道回读。
+%   - 'ref'  : 仅保存一个显示通道到 /I（体积最小；默认）
+%   - 'multi': 为 Cfg.Read.CList 中每个通道额外保存 /I_Cxx（支持 Merge 视频在无 ND2 时导出）
+Cfg.Output.FrameStoreMode    = 'ref';
+Cfg.Output.SaveTracksMAT     = true;
+Cfg.Output.SaveCSV           = true;
+
+%% ============================= 9) 调试（Debug） ==========================
+Cfg.Debug = struct();
+Cfg.Debug.Enable       = false;  % 是否允许输出 debug（总开关）
+Cfg.Debug.SingleXYOnly = true;  % 批量跑时只对“单XY”输出 PNG/视频（避免爆炸）
+Cfg.Debug.MaxFrames    = [];    % 限制最大帧数（空=[]表示全帧）
+Cfg.Debug.SaveFramePNG = true;  % 输出逐帧PNG（单XY调试）
+Cfg.Debug.SaveFuseLog  = true;  % 输出融合统计（配对数/主ref来自哪个通道等）
+Cfg.Debug.SaveVideo    = true;  % 输出 debug 视频
+Cfg.Debug.VideoFPS     = 10;    % 视频帧率
+Cfg.Debug.VideoShowC   = Cfg.Read.RefC; % 视频背景通道（默认=RefC）
+Cfg.Debug.TailLen      = 25;    % 轨迹尾巴长度（帧）
+Cfg.Debug.ShowMemBand = true; % Debug 面板/视频叠加主ref的 memBand 轮廓（用于检查环带厚度）
+Cfg.Debug.ShowMemMask = false; % Debug 面板叠加该通道自身 memMask 轮廓（只对 CType=mem 有意义；默认关闭以免太乱）
+Cfg.Debug.SaveVideoBoth = true; % 若存在 OtherC，则额外保存一份以 OtherC 为底图的视频
+Cfg.Debug.ShowOutline  = true;
+Cfg.Debug.OutlineColor = 'y';   % 叠加轮廓颜色（字符即可，简单）
+Cfg.Debug.OutlineLineWidth = 1.2;
+Cfg.Debug.Verbose      = true;  % 控制命令行输出
+
+%% ============================= 10) 并行（Parallel） =======================
+Cfg.Parallel = struct();
+Cfg.Parallel.Enable = true; % 需要 parfor 时打开（注意：debug 输出会自动收敛）
+% PoolSize：手动限制并行池 worker 数（用于按内存限制并发，避免 32GB 机器爆内存）
+%   [] 或 <=0：使用本机最大可用 worker 数
+%   例如：32GB 机器常设 4~6；128GB 机器可设 12~24（视图像大小/是否保存多通道 FrameStore 而定）
+% 查看本机最大可用 worker 数的方法：
+%   >> c = parcluster('local'); c.NumWorkers
+% 或：
+%   >> feature('numcores')
+Cfg.Parallel.PoolSize = [3];
+
+%% ============================= 11) 追踪后计算 & 可视化（可选） ==========
+% 来自你提供的 "GUV-Image-Processor-main" 两个脚本（Calculation/Visualization）。
+% 说明：默认关闭，避免批量跑时生成大量图像/耗时。
+Cfg.Compute = struct();
+Cfg.Compute.Enable = true;    % true=在每个 Series 跑完追踪后，额外计算 AllResults
+
+% --- 计算输入 ---
+Cfg.Compute.Z = Cfg.Read.Z;             % 计算用 Z（默认跟随读取）
+Cfg.Compute.Channel = Cfg.Read.RefC;    % 计算用通道（默认用 RefC；可改成内水/膜更适合分割的通道）
+Cfg.Compute.PixelSize_um = Cfg.PixelSize_um; % 计算单位换算（Pipeline 会覆盖）
+
+% 傅里叶平滑：保留的低频系数个数（越小越平滑，越大越贴近原轮廓）
+Cfg.Compute.n_keep = 12;
+
+% 指定要处理的轨迹 ID 列表：
+%   []  = 自动处理全部轨迹
+%   [3 7 9] = 只处理指定轨迹
+Cfg.Compute.IDs = [];
+
+% 是否在 Compute 输出目录写 AllResults.mat（建议 true）
+Cfg.Compute.SaveMAT = true;
+% 是否将 AllResults 另存为 CSV（便于统计/绘图；CSV 会忽略 StoredData 等嵌套字段）
+Cfg.Compute.ExportCSV = true;
+
+% --- 可视化（可选） ---
+Cfg.Compute.Visualize = struct();
+Cfg.Compute.Visualize.Enable = false;   % true=基于 AllResults 输出多张 png
+Cfg.Compute.Visualize.IDs = 20;         % 仅支持单一轨迹，输入AllResults轨迹ID
+
+%% ============================= 12) 视频导出（独立模块 Pipeline，可选） =====
+% 设计目标：
+%   - 视频导出作为一个“独立 Pipeline”，既可在主流程结束后自动调用，也可在运行结束后单独调用。
+%   - 默认优先使用 FrameStore.h5（不重新跑识别/追踪）。若 FrameStore 不含所需通道，则可回退读取 ND2。
+Cfg.Video = struct();
+Cfg.Video.Enable = false;     % 总开关
+Cfg.Video.When   = 'after';   % 'after'：主流程结束后调用；（'during' 预留，建议用 after）
+
+% 导出格式
+Cfg.Video.Format  = 'mp4';    % 'mp4' 或 'avi'
+Cfg.Video.FPS     = 10;
+Cfg.Video.Quality = 50;       % mp4 / MotionJPEG AVI 的质量 0~100
+
+% 导出任务：支持单通道 + Merge（双通道伪彩叠加）
+% 可选值：{'C1','C2','Merge'}，其中 C1/C2 对应 Cfg.Read.CList(1/2)
+Cfg.Video.Tasks = {'Merge'};
+
+% 指定要导出的 XY（Series）列表：[] 表示导出所有存在 XY 目录的视野
+Cfg.Video.SeriesList = [];
+
+% 严格模式：true 时若 FrameStore 缺失所需通道将报错（不回读 ND2）
+Cfg.Video.UseFrameStoreOnly = false;
+
+% 输出目录（相对每个 XY 目录）
+Cfg.Video.OutputSubdir = 'Video';
+
+% 对比度：每个通道独立设置 [Min Max]（uint16 强度）；[] 表示自动估计（按采样分位数）
+Cfg.Video.Contrast = struct();
+Cfg.Video.Contrast.C1 = [];   % e.g. [500 30000]
+Cfg.Video.Contrast.C2 = [];   % e.g. [800 45000]
+
+% 伪色：每个通道独立设置 RGB（0~1）
+Cfg.Video.Color = struct();
+Cfg.Video.Color.C1 = [0 1 0]; % green
+Cfg.Video.Color.C2 = [1 0 0]; % red
+
+% 物理标尺
+Cfg.Video.ScaleBar = struct();
+Cfg.Video.ScaleBar.Enable       = true;
+Cfg.Video.ScaleBar.Length_um    = 50;
+Cfg.Video.ScaleBar.Thickness_px = 6;
+Cfg.Video.ScaleBar.Position     = 'bottom-right'; % 'bottom-right'/'bottom-left'/'top-right'/'top-left'
+Cfg.Video.ScaleBar.FontSize     = 48;
+Cfg.Video.ScaleBar.Color        = [1 1 1];
+
+% 时间戳
+Cfg.Video.TimeStamp = struct();
+Cfg.Video.TimeStamp.Enable     = true;
+Cfg.Video.TimeStamp.StartFrame = 1;
+Cfg.Video.TimeStamp.Interval_s = Cfg.FrameInterval_s; % 默认用全局帧间隔
+Cfg.Video.TimeStamp.Position   = [20 30];  % [X Y]，单位=像素坐标
+Cfg.Video.TimeStamp.FontSize   = 48;
+Cfg.Video.TimeStamp.Color      = [1 1 1];
+Cfg.Video.TimeStamp.Unit       = 'min';    % 's'/'min'
+
+
+end
